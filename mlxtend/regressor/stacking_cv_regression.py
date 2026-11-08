@@ -19,8 +19,9 @@ from sklearn import __version__ as sklearn_version
 from sklearn.base import RegressorMixin, TransformerMixin, clone
 from sklearn.model_selection import cross_val_predict
 from sklearn.model_selection._split import check_cv
-from sklearn.utils import check_X_y
+from sklearn.utils import _safe_indexing, check_X_y
 
+from ..externals._partial_oof import partial_oof, prepare_oof
 from ..externals.estimator_checks import check_is_fitted
 from ..externals.name_estimators import _name_estimators
 from ..utils.base_compostion import _BaseXComposition
@@ -49,6 +50,12 @@ class StackingCVRegressor(_BaseXComposition, RegressorMixin, TransformerMixin):
         - An object to be used as a cross-validation generator.
         - An iterable yielding train, test splits.
         For integer/None inputs, it will use `KFold` cross-validation
+
+        TimeSeriesSplit and explicit split iterables may leave samples out
+        of the test sets. Only rows appearing in a test set train the
+        meta-estimator; a warning reports this reduction. Test sets must not
+        overlap. Base estimators are still refitted on all input rows.
+        Partial cross-validation does not support metadata routing.
 
     shuffle : bool (default: True)
         If True,  and the `cv` argument is integer, the training data will
@@ -83,7 +90,8 @@ class StackingCVRegressor(_BaseXComposition, RegressorMixin, TransformerMixin):
         used for fitting the
         meta-regressor stored in the `self.train_meta_features_` array,
         which can be
-        accessed after calling `fit`.
+        accessed after calling `fit`. Rows correspond to the positional
+        indices in `train_meta_indices_`.
 
     n_jobs : int or None, optional (default=None)
         The number of CPUs to use to do the computation.
@@ -111,10 +119,15 @@ class StackingCVRegressor(_BaseXComposition, RegressorMixin, TransformerMixin):
 
     Attributes
     ----------
-    train_meta_features : numpy array, shape = [n_samples, n_regressors]
-        meta-features for training data, where n_samples is the
-        number of samples
-        in training data and len(self.regressors) is the number of regressors.
+    train_meta_features_ : numpy array, shape = [n_meta_samples, n_meta_features]
+        Out-of-fold base predictions, stored when store_train_meta_features
+        is True. Rows correspond to train_meta_indices_. Columns depend on
+        the number of base estimators and their prediction output dimensions.
+        Original input features are not included in this stored array.
+
+    train_meta_indices_ : numpy array, shape = [n_meta_samples]
+        Positional indices of the input rows used to train the meta-estimator,
+        in ascending order. For ordinary partitioning CV this is every row.
 
     Examples
     -----------
@@ -213,22 +226,42 @@ class StackingCVRegressor(_BaseXComposition, RegressorMixin, TransformerMixin):
         else:
             fit_params = dict(sample_weight=sample_weight)
         param_name = "fit_params" if sklearn_version < "1.4" else "params"
-        meta_features = np.column_stack(
-            [
-                cross_val_predict(
-                    regr,
-                    X,
-                    y,
-                    groups=groups,
-                    cv=kfold,
-                    verbose=self.verbose,
-                    n_jobs=self.n_jobs,
-                    **{param_name: fit_params},
-                    pre_dispatch=self.pre_dispatch,
-                )
-                for regr in self.regr_
-            ]
-        )
+        splits, rows = prepare_oof(kfold, X, y, groups, self.cv)
+        self.train_meta_indices_ = rows
+        if len(rows) != len(y):
+            meta_features = np.column_stack(
+                [
+                    partial_oof(
+                        regr,
+                        X,
+                        y,
+                        splits,
+                        sample_weight,
+                        "predict",
+                        self.n_jobs,
+                        self.verbose,
+                        self.pre_dispatch,
+                    )
+                    for regr in self.regr_
+                ]
+            )
+        else:
+            meta_features = np.column_stack(
+                [
+                    cross_val_predict(
+                        regr,
+                        X,
+                        y,
+                        groups=groups,
+                        cv=splits,
+                        verbose=self.verbose,
+                        n_jobs=self.n_jobs,
+                        **{param_name: fit_params},
+                        pre_dispatch=self.pre_dispatch,
+                    )
+                    for regr in self.regr_
+                ]
+            )
 
         # save meta-features for training data
         if self.store_train_meta_features:
@@ -238,14 +271,18 @@ class StackingCVRegressor(_BaseXComposition, RegressorMixin, TransformerMixin):
         if not self.use_features_in_secondary:
             pass
         elif sparse.issparse(X):
-            meta_features = sparse.hstack((X, meta_features))
+            meta_features = sparse.hstack((_safe_indexing(X, rows), meta_features))
         else:
-            meta_features = np.hstack((X, meta_features))
+            meta_features = np.hstack((_safe_indexing(X, rows), meta_features))
 
         if sample_weight is None:
-            self.meta_regr_.fit(meta_features, y)
+            self.meta_regr_.fit(meta_features, _safe_indexing(y, rows))
         else:
-            self.meta_regr_.fit(meta_features, y, sample_weight=sample_weight)
+            self.meta_regr_.fit(
+                meta_features,
+                _safe_indexing(y, rows),
+                sample_weight=_safe_indexing(sample_weight, rows),
+            )
 
         # Retrain base models on all data
         for regr in self.regr_:

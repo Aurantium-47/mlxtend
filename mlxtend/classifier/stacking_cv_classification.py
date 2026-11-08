@@ -16,7 +16,9 @@ from sklearn.base import TransformerMixin, clone
 from sklearn.model_selection import cross_val_predict
 from sklearn.model_selection._split import check_cv
 from sklearn.preprocessing import LabelEncoder
+from sklearn.utils import _safe_indexing
 
+from ..externals._partial_oof import partial_oof, prepare_oof
 from ..externals.estimator_checks import check_is_fitted
 from ..externals.name_estimators import _name_estimators
 from ..utils.base_compostion import _BaseXComposition
@@ -64,6 +66,14 @@ class StackingCVClassifier(
         For integer/None inputs, it will use either a `KFold` or
         `StratifiedKFold` cross validation depending the value of `stratify`
         argument.
+        TimeSeriesSplit and explicit split iterables may leave samples out
+        of the test sets. Only rows appearing in a test set train the
+        meta-estimator; a warning reports this reduction. Test sets must not
+        overlap. Base estimators are still refitted on all input rows.
+        Partial cross-validation does not support metadata routing.
+        Partial classification requires a single target and every class to
+        occur among the retained meta-training rows.
+
     shuffle : bool (default: True)
         If True,  and the `cv` argument is integer, the training data will be
         shuffled at fitting stage prior to cross-validation. If the `cv`
@@ -94,7 +104,8 @@ class StackingCVClassifier(
         If True, the meta-features computed from the training data used
         for fitting the meta-classifier stored in the
         `self.train_meta_features_` array, which can be
-        accessed after calling `fit`.
+        accessed after calling `fit`. Rows correspond to the positional
+        indices in `train_meta_indices_`.
     use_clones : bool (default: True)
         Clones the classifiers for stacking classification if True (default)
         or else uses the original ones, which will be refitted on the dataset
@@ -134,10 +145,15 @@ class StackingCVClassifier(
     classes_ : ndarray of shape (n_classes,) or list of ndarray if `y` \
             is of type `"multilabel-indicator"`.
             Class labels.
-    train_meta_features : numpy array, shape = [n_samples, n_classifiers]
-        meta-features for training data, where n_samples is the
-        number of samples
-        in training data and n_classifiers is the number of classfiers.
+    train_meta_features_ : numpy array, shape = [n_meta_samples, n_meta_features]
+        Out-of-fold base predictions, stored when store_train_meta_features
+        is True. Rows correspond to train_meta_indices_. Columns depend on
+        the number of base estimators and their prediction output dimensions.
+        Original input features are not included in this stored array.
+
+    train_meta_indices_ : numpy array, shape = [n_meta_samples]
+        Positional indices of the input rows used to train the meta-estimator,
+        in ascending order. For ordinary partitioning CV this is every row.
 
     Examples
     -----------
@@ -253,6 +269,19 @@ class StackingCVClassifier(
         else:
             fit_params = dict(sample_weight=sample_weight)
 
+        splits, rows = prepare_oof(final_cv, X, y, groups, self.cv)
+        self.train_meta_indices_ = rows
+        is_partial = len(rows) != len(y)
+        if is_partial:
+            if y.ndim != 1:
+                raise ValueError(
+                    "Partial cross-validation requires single-output classification."
+                )
+            if not np.array_equal(np.unique(_safe_indexing(y, rows)), self.classes_):
+                raise ValueError(
+                    "Cross-validation test sets must contain every target class "
+                    "to train the meta-classifier."
+                )
         meta_features = None
 
         for n, model in enumerate(self.clfs_):
@@ -271,18 +300,31 @@ class StackingCVClassifier(
                 print(_name_estimators((model,))[0][1])
 
             param_name = "fit_params" if sklearn_version < "1.4" else "params"
-            prediction = cross_val_predict(
-                model,
-                X,
-                y,
-                groups=groups,
-                cv=final_cv,
-                n_jobs=self.n_jobs,
-                **{param_name: fit_params},
-                verbose=self.verbose,
-                pre_dispatch=self.pre_dispatch,
-                method="predict_proba" if self.use_probas else "predict",
-            )
+            if is_partial:
+                prediction = partial_oof(
+                    model,
+                    X,
+                    y,
+                    splits,
+                    sample_weight,
+                    "predict_proba" if self.use_probas else "predict",
+                    self.n_jobs,
+                    self.verbose,
+                    self.pre_dispatch,
+                )
+            else:
+                prediction = cross_val_predict(
+                    model,
+                    X,
+                    y,
+                    groups=groups,
+                    cv=splits,
+                    n_jobs=self.n_jobs,
+                    **{param_name: fit_params},
+                    verbose=self.verbose,
+                    pre_dispatch=self.pre_dispatch,
+                    method="predict_proba" if self.use_probas else "predict",
+                )
 
             if not self.use_probas:
                 prediction = prediction[:, np.newaxis]
@@ -308,12 +350,18 @@ class StackingCVClassifier(
 
         # Fit the secondary model
         if self.use_features_in_secondary:
-            meta_features = self._stack_first_level_features(X, meta_features)
+            meta_features = self._stack_first_level_features(
+                _safe_indexing(X, rows), meta_features
+            )
 
         if sample_weight is None:
-            self.meta_clf_.fit(meta_features, y)
+            self.meta_clf_.fit(meta_features, _safe_indexing(y, rows))
         else:
-            self.meta_clf_.fit(meta_features, y, sample_weight=sample_weight)
+            self.meta_clf_.fit(
+                meta_features,
+                _safe_indexing(y, rows),
+                sample_weight=_safe_indexing(sample_weight, rows),
+            )
 
         return self
 
